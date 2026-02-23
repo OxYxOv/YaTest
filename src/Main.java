@@ -1,6 +1,8 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -19,12 +21,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.HashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class Main {
     private static final DateTimeFormatter OUTPUT_TIME_FORMAT = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     public static void main(String[] args) throws IOException {
         int port = readPort(args);
@@ -122,6 +122,8 @@ public class Main {
                 }
 
                 writeJson(exchange, 404, "{\"error\":\"not_found\"}");
+            } catch (NumberFormatException e) {
+                writeJson(exchange, 400, "{\"error\":\"invalid_number\"}");
             } catch (IllegalArgumentException e) {
                 writeJson(exchange, 400, "{\"error\":\"bad_request\"}");
             } catch (DateTimeParseException e) {
@@ -194,7 +196,7 @@ public class Main {
         private static int readInt(Map<String, String> data, String key, String alternativeKey) {
             String value = data.containsKey(key) ? data.get(key) : data.get(alternativeKey);
             if (value == null) {
-                throw new IllegalArgumentException();
+                throw new IllegalArgumentException("Missing required field: " + key + " or " + alternativeKey);
             }
             return Integer.parseInt(value);
         }
@@ -202,21 +204,24 @@ public class Main {
         private static String readString(Map<String, String> data, String key, String alternativeKey) {
             String value = data.containsKey(key) ? data.get(key) : data.get(alternativeKey);
             if (value == null) {
-                throw new IllegalArgumentException();
+                throw new IllegalArgumentException("Missing required field: " + key + " or " + alternativeKey);
             }
             return value;
         }
 
         private static Map<String, String> parseJson(String body) {
-            Map<String, String> data = new HashMap<>();
-            Matcher matcher = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(\"([^\"]*)\"|[-0-9]+)").matcher(body);
-            while (matcher.find()) {
-                String key = matcher.group(1);
-                String raw = matcher.group(2);
-                String value = raw.startsWith("\"") ? matcher.group(3) : raw;
-                data.put(key, value);
+            try {
+                Map<String, Object> raw = OBJECT_MAPPER.readValue(body, new TypeReference<Map<String, Object>>() {});
+                Map<String, String> data = new java.util.HashMap<>();
+                for (Map.Entry<String, Object> entry : raw.entrySet()) {
+                    if (entry.getValue() != null) {
+                        data.put(entry.getKey(), String.valueOf(entry.getValue()));
+                    }
+                }
+                return data;
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Invalid JSON body", e);
             }
-            return data;
         }
     }
 
@@ -235,6 +240,7 @@ public class Main {
             try (Connection connection = open();
                  Statement statement = connection.createStatement()) {
                 statement.execute("CREATE TABLE IF NOT EXISTS bookings (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, place_id INTEGER NOT NULL, time_from TIMESTAMP NOT NULL, time_to TIMESTAMP NOT NULL)");
+                statement.execute("CREATE INDEX IF NOT EXISTS idx_bookings_place_id ON bookings(place_id)");
             } catch (SQLException e) {
                 throw new RuntimeException(e);
             }
@@ -296,18 +302,13 @@ public class Main {
         boolean hasOverlap(int placeId, LocalDateTime from, LocalDateTime to) throws SQLException {
             try (Connection connection = open();
                  PreparedStatement statement = connection.prepareStatement(
-                         "SELECT time_from, time_to FROM bookings WHERE place_id = ? AND time_from < ? AND time_to > ? LIMIT 1"
+                         "SELECT 1 FROM bookings WHERE place_id = ? AND time_from < ? AND time_to > ? LIMIT 1"
                  )) {
                 statement.setInt(1, placeId);
                 statement.setTimestamp(2, Timestamp.valueOf(to));
                 statement.setTimestamp(3, Timestamp.valueOf(from));
                 try (ResultSet resultSet = statement.executeQuery()) {
-                    if (!resultSet.next()) {
-                        return false;
-                    }
-                    LocalDateTime existingFrom = resultSet.getTimestamp("time_from").toLocalDateTime();
-                    LocalDateTime existingTo = resultSet.getTimestamp("time_to").toLocalDateTime();
-                    return isOverlapping(existingFrom, existingTo, from, to);
+                    return resultSet.next();
                 }
             }
         }
